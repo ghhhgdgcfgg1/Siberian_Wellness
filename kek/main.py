@@ -1522,10 +1522,11 @@ def category_card_keyboard(index: int, total: int, prefix: str, perfume, telegra
 @dp.callback_query(F.data.startswith("cat_scent_"))
 async def show_scent_category_handler(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+
     scent_map = {
         "floral": "цветочные",
         "citrus": "цитрусовые",
-        "niche":"нишевые",
+        "niche": "нишевые",
         "woody": "древесные",
         "oriental": "восточные",
         "fruity": "фруктовые",
@@ -1539,7 +1540,7 @@ async def show_scent_category_handler(callback: CallbackQuery, state: FSMContext
 
     category = scent_map[key]
     category_lower = category.casefold()
-    
+
     items = []
     for p in perfumes:
         scent_data = p.get("scent_category", "")
@@ -1550,7 +1551,7 @@ async def show_scent_category_handler(callback: CallbackQuery, state: FSMContext
             for scent_item in scent_data:
                 if isinstance(scent_item, str) and category_lower in scent_item.casefold():
                     items.append(p)
-                    break  
+                    break
 
     if not items:
         await callback.message.answer("😔 В этой категории пока нет товаров")
@@ -1559,9 +1560,15 @@ async def show_scent_category_handler(callback: CallbackQuery, state: FSMContext
 
     await state.update_data(cat_items=items, cat_index=0)
 
-    perfume = items[0]
-    
-    # Добавляем информацию о поле и объеме
+    perfume = items[0]  # ✅ ВАЖНО: сначала объявили
+
+    photo_path = BASE_DIR / perfume["photo"]  # ✅ теперь можно
+
+    if not photo_path.exists():
+        await callback.message.answer("Фото не найдено 😢")
+        await callback.answer()
+        return
+
     caption = (
         f"<b>{perfume['name']}</b>\n"
         f"Пол: {perfume.get('category', 'не указано')}\n"
@@ -1569,20 +1576,20 @@ async def show_scent_category_handler(callback: CallbackQuery, state: FSMContext
     )
 
     await callback.message.answer_photo(
-        photo=FSInputFile(perfume["photo"]),
+        photo=FSInputFile(photo_path),
         caption=caption,
         reply_markup=category_card_keyboard(
-    0,
-    len(items),
-    "scent",
-    perfume,
-    callback.from_user.id
-),
-
+            0,
+            len(items),
+            "scent",
+            perfume,
+            callback.from_user.id
+        ),
         parse_mode="HTML",
     )
 
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("cat_open_"))
 async def category_open(callback: CallbackQuery, state: FSMContext):
