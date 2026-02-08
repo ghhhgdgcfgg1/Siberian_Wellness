@@ -16,6 +16,8 @@ from aiogram.types import (
     InputMediaPhoto,
     MenuButtonDefault
 )
+from aiogram.filters import StateFilter
+
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -26,13 +28,35 @@ import io
 import requests
 from aiogram import Router
 import aiohttp
+from aiogram.exceptions import TelegramBadRequest
 router = Router()
-
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent
+#PHOTOS_DIR = BASE_DIR / "photos"
 #import requests
 #FLASK_URL = "http://127.0.0.1:5000/"
 user_favorites = {}
 
-
+async def safe_edit_text(message, text, reply_markup=None, parse_mode="HTML"):
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+    except TelegramBadRequest as e:
+        # сообщение без текста
+        if "there is no text in the message" in str(e):
+            await message.answer(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+        # текст тот же самый — просто игнорируем
+        elif "message is not modified" in str(e):
+            pass
+        else:
+            raise
 """"
 async def track(telegram_id, event, value=""):
     async with aiohttp.ClientSession() as session:
@@ -104,8 +128,12 @@ async def resize_photo(photo_path: str, max_size: tuple = (1000, 1000),
     border_radius: радиус скругления углов
     shadow_offset: смещение тени
     """
+    full_path = BASE_DIR / photo_path
     # Открываем изображение
-    with Image.open(photo_path) as img:
+    #photo_path
+    if not full_path.exists():
+        raise FileNotFoundError(f"Фото не найдено: {full_path}")
+    with Image.open(full_path) as img:
         # Конвертируем RGBA в RGB если нужно
         if img.mode in ('RGBA', 'LA', 'P'):
             # Создаем белый фон для прозрачных изображений
@@ -175,7 +203,15 @@ async def resize_photo(photo_path: str, max_size: tuple = (1000, 1000),
         final_img.save(temp_path, "PNG", quality=95, optimize=True)
         
         return FSInputFile(temp_path)
+"""
+def get_photo_input(photo_name: str) -> FSInputFile:
+    path = PHOTOS_DIR / photo_name
 
+    if not path.exists():
+        raise FileNotFoundError(f"Фото не найдено: {path}")
+
+    return FSInputFile(path)
+"""
 def order_keyboard(source: str, index: int):
     kb = InlineKeyboardBuilder()
 
@@ -191,165 +227,232 @@ def order_keyboard(source: str, index: int):
 
     kb.adjust(1)
     return kb.as_markup()
+
 @dp.callback_query(F.data.startswith("order_back:"))
 async def order_back(callback: CallbackQuery, state: FSMContext):
     _, source, index = callback.data.split(":")
     index = int(index)
+    
+    # Удаляем старое фото (фото подробного описания) если есть
     data = await state.get_data()
-    photo_id = data.get("order_photo_id")
-    
-    # Удаляем сообщение "Сделать заказ"
-    await callback.message.delete()
-    
-    # Если фото есть, удаляем старое фото
-    if photo_id:
-        await callback.bot.delete_message(
-            chat_id=callback.message.chat.id,
-            message_id=photo_id
-        )
-    
-    # Очищаем данные о фото
-    await state.update_data(order_photo_id=None)
-
-    # Удаляем старое сообщение с пагинацией
-    prev_message_id = data.get("order_message_id")
-    if prev_message_id:
+    old_photo_id = data.get("order_photo_id")
+    if old_photo_id:
         try:
             await callback.bot.delete_message(
                 chat_id=callback.message.chat.id,
-                message_id=prev_message_id
+                message_id=old_photo_id
             )
-        except Exception as e:
-            print(f"Error deleting previous message: {e}")
+        except:
+            pass
+        await state.update_data(order_photo_id=None)
+    
+    # Удаляем сообщение с описанием и кнопкой "Назад"
+    try:
+        await callback.message.delete()
+    except:
+        pass
 
-    # 🔙 КАТАЛОГ
+    # Получаем ID оригинальной карточки, которую нужно восстановить
+    original_card_id = data.get("original_card_id")
+
+    # --- ЛОГИКА ДЛЯ РАЗНЫХ РАЗДЕЛОВ ---
+    
     if source == "catalog":
         perfume = perfumes[index]
-        framed = await resize_photo(perfume["photo"])
-
-        # Отправляем новую карточку товара с пагинацией
-        new_message = await callback.message.answer_photo(
-            framed,
-            caption=(f"<b>{perfume['name']}</b>\n"
-                     f"Пол: {perfume['category']}\n"
-                     f"Объём: {perfume['volume']}"),
-            parse_mode="HTML",
-            reply_markup=catalog_card_keyboard(index, callback.from_user.id)
+        markup = catalog_card_keyboard(index, callback.from_user.id)
+        
+        framed_photo = await resize_photo(perfume["photo"], 
+                                         border_radius=20, 
+                                         shadow_offset=4)
+        
+        caption = (
+            f"<b>{perfume['name']}</b>\n"
+            f"Пол: {perfume['category']}\n"
+            f"Объём: {perfume['volume']}\n"
         )
-
-        # Сохраняем message_id нового сообщения
-        await state.update_data(order_message_id=new_message.message_id)
-
-    # 🔙 КАТЕГОРИЯ
+        
+        if original_card_id:
+            try:
+                await callback.bot.edit_message_media(
+                    chat_id=callback.message.chat.id,
+                    message_id=original_card_id,
+                    media=InputMediaPhoto(
+                        media=framed_photo,
+                        caption=caption,
+                        parse_mode="HTML"
+                    ),
+                    reply_markup=markup
+                )
+            except TelegramBadRequest as e:
+                # ИСПРАВЛЕНИЕ: Если сообщение не изменилось, ничего не делаем (не дублируем)
+                if "message is not modified" in str(e):
+                    pass
+                else:
+                    # Если другая ошибка (например, сообщение удалено), отправляем новое
+                    await callback.message.answer_photo(
+                        photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+                    )
+            except Exception:
+                # Общая ошибка - отправляем новое
+                await callback.message.answer_photo(
+                    photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+                )
+        else:
+            await callback.message.answer_photo(
+                photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+            )
+        
     elif source == "category":
         items = data.get("cat_items", [])
         perfume = items[index]
-
-        framed = await resize_photo(perfume["photo"])
-
-        # Отправляем новую карточку товара с пагинацией
-        new_message = await callback.message.answer_photo(
-            framed,
-            caption=f"<b>{perfume['name']}</b>",
-            parse_mode="HTML",
-            reply_markup=category_card_keyboard(
-                index,
-                len(items),
-                data.get("back_prefix", "gender"),
-                perfume,
-                callback.from_user.id
-            )
+        prefix = data.get("back_prefix", "gender")
+        
+        categories = []
+        category2 = perfume.get("category2", [])
+        if isinstance(category2, str):
+            categories = [category2]
+        elif isinstance(category2, list):
+            categories = category2
+        else:
+            categories = [perfume.get("category", "не указано")]
+        
+        categories_text = ", ".join(categories) if isinstance(categories, list) else str(categories)
+        caption = (
+            f"<b>{perfume['name']}</b>\n"
+            f"Пол: {categories_text}\n"
+            f"Объём: {perfume.get('volume', 'не указано')}"
         )
-
-        # Сохраняем message_id нового сообщения
-        await state.update_data(order_message_id=new_message.message_id)
-
-    # 🔙 ПОИСК
+        
+        markup = category_card_keyboard(index, len(items), prefix, perfume, callback.from_user.id)
+        
+        framed_photo = await resize_photo(
+            perfume["photo"], 
+            max_size=(800, 800), 
+            border_radius=20, 
+            shadow_offset=8
+        )
+        
+        if original_card_id:
+            try:
+                await callback.bot.edit_message_media(
+                    chat_id=callback.message.chat.id,
+                    message_id=original_card_id,
+                    media=InputMediaPhoto(
+                        media=framed_photo,
+                        caption=caption,
+                        parse_mode="HTML"
+                    ),
+                    reply_markup=markup
+                )
+            except TelegramBadRequest as e:
+                # ИСПРАВЛЕНИЕ
+                if "message is not modified" in str(e):
+                    pass
+                else:
+                    await callback.message.answer_photo(
+                        photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+                    )
+            except Exception:
+                await callback.message.answer_photo(
+                    photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+                )
+        else:
+            await callback.message.answer_photo(
+                photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+            )
+        
     elif source == "search":
         results = data.get("search_results", [])
         perfume = results[index]
-
-        framed = await resize_photo(perfume["photo"])
-
-        # Отправляем новую карточку товара с пагинацией
-        new_message = await callback.message.answer_photo(
-            framed,
-            caption=f"<b>{perfume['name']}</b>",
-            parse_mode="HTML",
-            reply_markup=search_card_keyboard(
-                index,
-                len(results),
-                callback.from_user.id,
-                perfume
-            )
+        
+        caption = (
+            f"<b>{perfume['name']}</b>\n"
+            f"Пол: {perfume.get('category', 'не указано')}\n"
+            f"Объём: {perfume.get('volume', 'не указано')}"
         )
-
-        # Сохраняем message_id нового сообщения
-        await state.update_data(order_message_id=new_message.message_id)
-
+        
+        markup = search_card_keyboard(index, len(results), callback.from_user.id, perfume)
+        
+        framed_photo = await resize_photo(perfume["photo"], 
+                                         max_size=(800, 800), 
+                                         border_radius=20, 
+                                         shadow_offset=8)
+        
+        if original_card_id:
+            try:
+                await callback.bot.edit_message_media(
+                    chat_id=callback.message.chat.id,
+                    message_id=original_card_id,
+                    media=InputMediaPhoto(
+                        media=framed_photo,
+                        caption=caption,
+                        parse_mode="HTML"
+                    ),
+                    reply_markup=markup
+                )
+            except TelegramBadRequest as e:
+                # ИСПРАВЛЕНИЕ
+                if "message is not modified" in str(e):
+                    pass
+                else:
+                    await callback.message.answer_photo(
+                        photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+                    )
+            except Exception:
+                await callback.message.answer_photo(
+                    photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+                )
+        else:
+            await callback.message.answer_photo(
+                photo=framed_photo, caption=caption, reply_markup=markup, parse_mode="HTML"
+            )
+    
+    else:
+        await callback.answer("Ошибка возврата")
+        return
+    
     await callback.answer()
 
-
 @dp.callback_query(F.data == "order_info")
-async def order_info(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    photo_id = data.get("order_photo_id")
-
-    # источник возврата
-    source = data.get("back_view")
-    index = (
-        data.get("catalog_index")
-        or data.get("back_index")
-        or 0
-    )
-
+async def order_info(callback: CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(
         text="⬅️ Назад",
-        callback_data=f"order_back:{source}:{index}"
+        callback_data="order_back_to_description"
     )
     kb.adjust(1)
-    
-    # 🧹 удаляем старое сообщение с пагинацией (если оно есть)
-    prev_message_id = data.get("order_message_id")
-    if prev_message_id:
-        try:
-            await call.bot.delete_message(
-                chat_id=call.message.chat.id,
-                message_id=prev_message_id
-            )
-        except Exception as e:
-            print(f"Error deleting previous message: {e}")
-    
-    # 🧹 удаляем photo2 (если оно есть)
-    if photo_id:
-        await call.bot.delete_message(
-            chat_id=call.message.chat.id,
-            message_id=photo_id
-        )
 
-    # очищаем id фото и старое сообщение
-    await state.update_data(order_photo_id=None, order_message_id=None)
+    await callback.message.answer(
+        """<u>Для оформления заказа обратитесь к человеку</u> который <b>пригласил Вас в чат</b> -  https://t.me/aromo_code
 
-    # 📄 отправляем информацию о заказе
-    order_message = await call.message.answer(
-        """<u>Для оформления заказа обратитесь к человеку</u> который <b>пригласил Вас в чат</b> - https://t.me/aromo_code
+Или напишите Нашим администраторам
 
-<b>Или напишите Нашим администраторам</b>
-
-Лидия - @LidiyaKlimenteva  
+Лидия - @LidiyaKlimenteva
 Николай - @Naum_SW
 
-🎁 <b>При покупке двух и более ароматов подарок.</b>
-""",
+Арома гороскоп в подарок каждому участнику чата по запросу.
+
+<b>🎁 При покупке двух и более ароматов подарок.</b> Расчет натальной карты и <u>ответы на 5 ключевых вопросов</u>
+https://t.me/aromo_code
+пишите <b>'хочу разбор'</b>
+
+Наша компания международная и охватывает почти все страны мира. Офисы компании присутствуют в большинстве городов России и во всех странах СНГ. Доставка от компании возможна почти по всей России (уточняйте у администраторов). По Москве, Санкт-Петербургу и другим крупным городам России возможна курьерская доставка день в день.""",
         reply_markup=kb.as_markup(),
         parse_mode="HTML"
     )
 
-    # Сохраняем message_id нового сообщения, чтобы не было дубликатов
-    await state.update_data(order_message_id=order_message.message_id)
+    await callback.answer()
 
-    await call.answer()
+@dp.callback_query(F.data == "order_back_to_description")
+async def order_back_to_description(callback: CallbackQuery):
+    try:
+        await callback.message.delete()
+    except:
+        pass
+
+    # НИЧЕГО не пересоздаём
+    # описание уже есть
+    await callback.answer()
 
 
 
@@ -384,12 +487,12 @@ async def back_to_search(callback: CallbackQuery, state: FSMContext):
         f"Пол: {perfume.get('category', 'не указано')}\n"
         f"Объём: {perfume.get('volume', 'не указано')}\n"
     )
-    
+    """
     if search_type == "note":
         caption += f"<i>Найдено по ноте: {data.get('search_query', '')}</i>"
-    elif search_type == "brand2":
+    """
+    if search_type == "":
         caption += f"<i>Найдено по бренду: {data.get('search_query', '')}</i>"
-    
     # Редактируем сообщение с товаром
     try:
         await callback.message.edit_media(
@@ -587,7 +690,8 @@ async def fav_navigation(callback: CallbackQuery):
 
 
 @dp.message(F.text == "⭐ Избранное")
-async def show_favorites(message: Message):
+async def show_favorites(message: Message, state: FSMContext):
+    await state.clear()
     uid = message.from_user.id
     fav_ids = list(user_favorites.get(uid, set()))
 
@@ -646,10 +750,10 @@ async def fav_remove(callback: CallbackQuery, state: FSMContext):
         items = [p for p in perfumes if p["id"] in user_favorites.get(uid, set())]
 
         if not items:
-            await callback.message.edit_caption(
-                caption="😔 У вас больше нет избранных ароматов",
-                reply_markup=None
-            )
+            await callback.message.delete()
+            await callback.message.answer(
+        "😔 У вас больше нет избранных ароматов"
+    )
             await callback.answer("Избранное пусто")
             return
 
@@ -674,6 +778,18 @@ async def fav_remove(callback: CallbackQuery, state: FSMContext):
     await update_fav_keyboard(callback, state, source, index, uid)
     await callback.answer("❌ Удалено из избранного")
 
+
+
+async def safe_edit_text(message, text, reply_markup):
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
 
 
 async def update_fav_keyboard(callback, state: FSMContext, source, index, uid):
@@ -711,7 +827,8 @@ async def update_fav_keyboard(callback, state: FSMContext, source, index, uid):
 
 
 @dp.message(F.text == "📦 Посмотреть весь каталог")
-async def catalog_start(message: Message):
+async def catalog_start(message: Message, state: FSMContext):
+    await state.clear()
     perfume = perfumes[0]
 
     # Используем фото со стильной рамкой
@@ -737,12 +854,40 @@ def back_keyboard():
     return kb.as_markup()
 
 # Функции поиска
-def search_perfumes_by_name(query: str):
+def search_perfumes(query: str):
     query = query.lower()
-    return [
-        p for p in perfumes
-        if query in p["name"].lower()
-    ]
+    results = []
+
+    for p in perfumes:
+        fields = []
+
+        # название
+        fields.append(p.get("name", ""))
+
+        # бренд
+        fields.append(p.get("brand2", ""))
+        fields.append(p.get("brand", ""))
+        # ноты
+        """
+        notes = p.get("notes", [])
+        if isinstance(notes, list):
+            fields.extend(notes)
+        elif isinstance(notes, str):
+            fields.append(notes)
+        """
+        # категория аромата
+        scent = p.get("scent_category", [])
+        if isinstance(scent, list):
+            fields.extend(scent)
+        elif isinstance(scent, str):
+            fields.append(scent)
+
+        # проверка совпадения
+        if any(query in str(field).lower() for field in fields):
+            results.append(p)
+
+    return results
+
 
 def search_card_keyboard(index: int, total: int, telegram_id: int, perfume):
     
@@ -763,19 +908,20 @@ def search_card_keyboard(index: int, total: int, telegram_id: int, perfume):
 
 
 @dp.message(F.text == "/start")
-async def start(message: Message):
+async def start(message: Message, state: FSMContext):
+    await state.clear()
     text = """🌸 <b>Добро пожаловать в мир изысканных ароматов!</b> 🌸
 Вы любите качественный парфюм, но не готовы переплачивать? У Нас — идеальное решение: премиальные ароматы, но по приятной цене. А также нишевая линейка ароматов от известного бренда.
 
 <b>Почему Наши ароматы — Ваш лучший выбор?</b>
-Ароматы созданы известными парфюмерами по мотивам известных брендов. Тот же характер, те же ноты, тот же шарм.
+Ароматы созданы известными парфюмерами по мотивам известных брендов. Тот же характер, те же ноты, тот же шарм.
 
 <b>Качественный состав</b> — используем проверенные парфюмерные компоненты, безопасные и стойкие.
 Имеются все сертификаты качества и "честный знак".
 
 <b>Отличная стойкость</b> — ароматы держат положенное время и более, не теряя глубины и шлейфа.
 
-<b>Доступная цена!</b> Мы отказались от дорогостоящей коммерческой рекламы, для того чтобы Вы могли  экономить до 90 % по сравнению с ценами на люксовые бренды.
+<b>Доступная цена!</b> Мы отказались от дорогостоящей коммерческой рекламы, для того чтобы Вы могли  экономить до 90 % по сравнению с ценами на люксовые бренды.
 <b>Отличный шанс обрести роскошный парфюм без переплат!</b>
 
 Ниже для Вас доступен просмотр всего каталога - более 50ти ароматов; категории ароматов и поиск по совпадению слов."""
@@ -793,14 +939,14 @@ async def back_to_start(callback: CallbackQuery):
 Вы любите качественный парфюм, но не готовы переплачивать? У Нас — идеальное решение: премиальные ароматы, но по приятной цене. А также нишевая линейка ароматов от известного бренда.
 
 <b>Почему Наши ароматы — Ваш лучший выбор?</b>
-Ароматы созданы известными парфюмерами по мотивам известных брендов. Тот же характер, те же ноты, тот же шарм.
+Ароматы созданы известными парфюмерами по мотивам известных брендов. Тот же характер, те же ноты, тот же шарм.
 
 <b>Качественный состав</b> — используем проверенные парфюмерные компоненты, безопасные и стойкие.
 Имеются все сертификаты качества и "честный знак".
 
 <b>Отличная стойкость</b> — ароматы держат положенное время и более, не теряя глубины и шлейфа.
 
-<b>Доступная цена!</b> Мы отказались от дорогостоящей коммерческой рекламы, для того чтобы Вы могли  экономить до 90 % по сравнению с ценами на люксовые бренды.
+<b>Доступная цена!</b> Мы отказались от дорогостоящей коммерческой рекламы, для того чтобы Вы могли  экономить до 90 % по сравнению с ценами на люксовые бренды.
 <b>Отличный шанс обрести роскошный парфюм без переплат!</b>
 
 Ниже для Вас доступен просмотр всего каталога - более 50ти ароматов; категории ароматов и поиск по совпадению слов."""
@@ -813,7 +959,8 @@ async def back_to_start(callback: CallbackQuery):
     await callback.answer()
 
 @dp.message(Command("catalog"))
-async def catalog_command(message: Message):
+async def catalog_command(message: Message, state: FSMContext):
+    await state.clear()
     kb = InlineKeyboardBuilder()
     for p in perfumes:
         kb.button(text=p["name"], callback_data=f"perf_{p['id']}")
@@ -828,23 +975,18 @@ async def catalog_command(message: Message):
 
 
 @dp.message(Command("categories"))
-async def show_categories_command(message: Message):
+async def show_categories_command(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "📂 В данном разделе Вы сможете выбрать нужную категорию ароматов:",
         reply_markup=categories_keyboard()
     )
 
 # Обработчики выбора типа поиска
-"""
-@dp.callback_query(F.data == "search_by_name")
-async def search_by_name_handler(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(SearchState.waiting_query)
-    await callback.message.edit_text("Поиск по названию Вашего любимого аромата известного бренда либо по названию аромата нашего бренда. Введите название:")
-    await callback.answer()
-"""
 
 @dp.callback_query(F.data.startswith("cat_gender_"))
 async def show_gender_category_handler(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     gender_type = callback.data.replace("cat_gender_", "")
     
     # Маппинг callback-данных на значения категорий
@@ -1012,7 +1154,8 @@ async def category_navigation_handler(callback: CallbackQuery, state: FSMContext
     await callback.answer()
 
 @dp.message(F.text == "📂 Категории")
-async def show_categories(message: Message):
+async def show_categories(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "📂 В данном разделе Вы сможете выбрать нужную категорию ароматов:",
         reply_markup=categories_keyboard()
@@ -1034,35 +1177,45 @@ def catalog_card_keyboard(index: int, telegram_id: int):
 
     return kb.as_markup()
 
-
 @dp.callback_query(F.data.startswith("perf_"))
 async def show_perfume(callback: CallbackQuery, state: FSMContext):
     perfume_id = int(callback.data.replace("perf_", ""))
     perfume_index = next(i for i, p in enumerate(perfumes) if p["id"] == perfume_id)
     perfume = perfumes[perfume_index]
 
-    # 🔐 сохраняем, откуда пришли
+    # Сохраняем ID оригинальной карточки товара
+    original_card_id = callback.message.message_id
+    
+    # Сохраняем данные для возврата
     await state.update_data(
-        back_view="catalog",
-        catalog_index=perfume_index
+        origin_view="catalog",  # Добавляем источник
+        origin_index=perfume_index,  # Добавляем индекс
+        original_card_id=original_card_id  # ID карточки товара для возврата
     )
+    
+    # 📸 фото
+    photo_path = BASE_DIR / perfume["photo2"]
+    if not photo_path.exists():
+        await callback.message.answer("Фото не найдено 😢")
+        await callback.answer()
+        return
 
-    # 📸 ОДИН раз отправляем photo2 и сохраняем message_id
     photo_msg = await callback.message.answer_photo(
-        photo=FSInputFile(perfume["photo2"])
+        photo=FSInputFile(photo_path)
     )
-
     await state.update_data(order_photo_id=photo_msg.message_id)
 
-    # 📝 длинное описание отдельным сообщением
-    await callback.message.answer(
+    # 📝 описание
+    description_msg = await callback.message.answer(
         f"<b>Описание:</b>\n{perfume['description']}",
-        reply_markup=order_keyboard("catalog", perfume_index),
+        reply_markup=order_keyboard("catalog", perfume_index),  # Изменяем source на "catalog"
         parse_mode="HTML"
     )
+    
+    # Сохраняем ID сообщения с описанием для последующего удаления
+    await state.update_data(description_msg_id=description_msg.message_id)
 
     await callback.answer()
-
 
 
 @dp.callback_query(F.data.regexp(r"^search_(prev|next)_\d+$"))
@@ -1124,51 +1277,71 @@ async def search_open(callback: CallbackQuery, state: FSMContext):
     results = data["search_results"]
     perfume = results[index]
 
+    # Сохраняем ID оригинальной карточки товара
+    original_card_id = callback.message.message_id
+    
+    # Сохраняем данные для возврата
     await state.update_data(
-        back_view="search",
-        back_index=index
+        origin_view="search",  # Добавляем источник
+        origin_index=index,  # Добавляем индекс
+        original_card_id=original_card_id  # ID карточки товара для возврата
     )
+    
+    photo_path = BASE_DIR / perfume["photo2"]
+    if not photo_path.exists():
+        await callback.message.answer("Фото не найдено 😢")
+        await callback.answer()
+        return
+    
     photo_msg = await callback.message.answer_photo(
-    photo=FSInputFile(perfume["photo2"])
-)
+        photo=FSInputFile(photo_path)
+    )
     await state.update_data(order_photo_id=photo_msg.message_id)
-
 
     await callback.message.answer(
         f"<b>Описание:</b>\n{perfume.get('description','')}",
-        reply_markup=order_keyboard("search", index),
+        reply_markup=order_keyboard("search", index),  # source остается "search"
         parse_mode="HTML"
     )
 
     await callback.answer()
 
-
-
 # Обработчики поиска по разным типам
 @dp.message(SearchState.waiting_query)
 async def search_by_name_handler(message: Message, state: FSMContext):
-    query = message.text.lower().strip()
-    results = search_perfumes_by_name(query)
+    text = (message.text or "").strip()
 
-    if not results:
-        await message.answer(
-        """😔 Ничего не найдено попробуйте еще раз:\n 
-Поиск по названию Вашего любимого аромата известного бренда либо по названию аромата нашего бренда. Введите название:"""
-    )
-    # состояние НЕ очищаем
-
-    if len(results) == 0:
+    # ✅ Если снова нажали кнопку "🔍 Поиск" во время поиска — НЕ ищем, а просто подсказываем
+    if text == "🔍 Поиск":
+        await message.answer("🔍 Вы уже находитесь в поиске.\nВведите название аромата:")
         return
+
+    query = text.lower()
+
+    # защита от пустого ввода
+    if not query:
+        await message.answer("Введите название аромата для поиска:")
+        return
+
+    results = search_perfumes(query)
+
+    # ❌ Ничего не найдено — остаёмся в поиске и просим ввести ещё раз
+    if not results:
+        await message.answer("😔 По Вашему запросу ничего не найдено. Попробуйте ещё раз:")
+        return
+
+    # ✅ Есть результаты
     perfume = results[0]
+
     await state.update_data(
         search_results=results,
         search_index=0,
-        search_type="name",
-        search_query=query
+        search_type="mixed",
+        search_query=query,
+        back_view="search",
+        back_index=0
     )
 
-    
-    await state.set_state(SearchState.waiting_query)
     framed_photo = await resize_photo(perfume["photo"])
 
     await message.answer_photo(
@@ -1178,27 +1351,30 @@ async def search_by_name_handler(message: Message, state: FSMContext):
             f"Пол: {perfume.get('category', 'не указано')}\n"
             f"Объём: {perfume.get('volume', 'не указано')}"
         ),
-            reply_markup=search_card_keyboard(
-        0,
-        len(results),
-        message.from_user.id,
-        perfume
-    ),
+        reply_markup=search_card_keyboard(0, len(results), message.from_user.id, perfume),
         parse_mode="HTML"
     )
 
+
 @dp.callback_query(F.data == "back")
-async def back(callback: CallbackQuery):
+async def back(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.message.answer(
         "В данном разделе Вы сможете выбрать нужную категорию ароматов:",
         reply_markup=categories_keyboard()
     )
-
-@dp.message(F.text == "🔍 Поиск")
+@dp.message(F.text == "🔍 Поиск", StateFilter("*"))
 async def search_reply(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+
+    if current_state == SearchState.waiting_query:
+        await message.answer("🔍 Вы уже находитесь в поиске.\nВведите название аромата:")
+        return
+
     await state.set_state(SearchState.waiting_query)
     await message.answer(
-        "Поиск по названию Вашего любимого аромата известного бренда либо по названию аромата нашего бренда. Введите название:"
+        "Поиск по названию Вашего любимого аромата известного бренда либо по названию аромата нашего бренда. Введите название:",
+        parse_mode="HTML"
     )
 
 
@@ -1249,7 +1425,8 @@ async def category_navigation_handler(callback: CallbackQuery, state: FSMContext
     await callback.answer()
 
 @dp.callback_query(F.data.regexp(r"^nav_(prev|next)_\d+$"))
-async def catalog_navigation(callback: CallbackQuery):
+async def catalog_navigation(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     parts = callback.data.split("_")
     
     if len(parts) != 3:
@@ -1258,6 +1435,32 @@ async def catalog_navigation(callback: CallbackQuery):
     
     direction = parts[1]
     index = int(parts[2])
+
+    # Удаляем старое фото из описания если есть
+    data = await state.get_data()
+    old_photo_id = data.get("order_photo_id")
+    if old_photo_id:
+        try:
+            await callback.bot.delete_message(
+                chat_id=callback.message.chat.id,
+                message_id=old_photo_id
+            )
+        except:
+            pass
+        await state.update_data(order_photo_id=None)
+    
+    # Также удаляем сообщение с описанием, если оно открыто
+    # Вы можете сохранить message_id описания в состоянии при открытии
+    description_msg_id = data.get("description_msg_id")
+    if description_msg_id:
+        try:
+            await callback.bot.delete_message(
+                chat_id=callback.message.chat.id,
+                message_id=description_msg_id
+            )
+        except:
+            pass
+        await state.update_data(description_msg_id=None)
 
     if direction == "next" and index < len(perfumes) - 1:
         index += 1
@@ -1318,6 +1521,7 @@ def category_card_keyboard(index: int, total: int, prefix: str, perfume, telegra
 
 @dp.callback_query(F.data.startswith("cat_scent_"))
 async def show_scent_category_handler(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     scent_map = {
         "floral": "цветочные",
         "citrus": "цитрусовые",
@@ -1384,7 +1588,6 @@ async def show_scent_category_handler(callback: CallbackQuery, state: FSMContext
 async def category_open(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
 
-    # 🛡 защита
     if len(parts) < 4:
         await callback.answer("Ошибка навигации", show_alert=True)
         return
@@ -1401,26 +1604,34 @@ async def category_open(callback: CallbackQuery, state: FSMContext):
 
     perfume = items[index]
 
+    # Сохраняем ID оригинальной карточки товара
+    original_card_id = callback.message.message_id
+    
+    # Сохраняем данные для возврата
     await state.update_data(
         back_view="category",
         back_items=items,
         back_index=index,
-        back_prefix=category_type
+        back_prefix=category_type,
+        origin_view="category",  # Добавляем источник
+        origin_index=index,  # Добавляем индекс
+        original_card_id=original_card_id  # ID карточки товара для возврата
     )
+    
+    photo_path = BASE_DIR / perfume["photo2"]
+    if not photo_path.exists():
+        await callback.message.answer("Фото не найдено 😢")
+        await callback.answer()
+        return
+    
     photo_msg = await callback.message.answer_photo(
-    photo=FSInputFile(perfume["photo2"])
-)  
-    await state.update_data(order_photo_id=photo_msg.message_id)
-
-
-    perfume_index = next(
-        (i for i, p in enumerate(perfumes) if p["id"] == perfume["id"]),
-        0
+        photo=FSInputFile(photo_path)
     )
+    await state.update_data(order_photo_id=photo_msg.message_id)
 
     await callback.message.answer(
         f"<b>Описание:</b>\n{perfume.get('description','')}",
-        reply_markup=order_keyboard("category", index),
+        reply_markup=order_keyboard("category", index),  # Изменяем source на "category"
         parse_mode="HTML"
     )
 
